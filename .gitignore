@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments and temporary build dependencies
+.venv/
+.venv-*/
+.build-libs/
+.tmp-build/
+
+# Application build/output artifacts
+build/
+dist/
+output/
+tmp/
+assets/
+*.spec
+
+# Local tooling metadata
+.agents/
+.codex/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Private business data (a sanitized replacement is stored in sample_data/)
+/202601销售出库.xlsx

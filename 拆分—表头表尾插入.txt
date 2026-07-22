@@ -1,0 +1,159 @@
+Sub SplitAndInsertHeaderFooter()
+    On Error GoTo ErrorHandler
+    
+    Dim wsSource As Worksheet
+    Dim wbSource As Workbook
+    Dim wbTemplate As Workbook, wbNew As Workbook
+    Dim wsTemplate As Worksheet, wsNew As Worksheet
+    Dim templatePath As String, templateFile As String
+    Dim sourcePath As String
+    Dim lastRow As Long, i As Long, j As Long, col As Integer
+    Dim uniqueValues As Collection
+    Dim currentValue As String, saveName As String
+    Dim rng As Range, foundCell As Range
+    Dim firstAddress As String
+    Dim lastDataRowBeforeFooter As Long
+    
+    ' 获取当前工作簿路径（源文件位置）
+    Set wbSource = ActiveWorkbook
+    sourcePath = wbSource.Path
+    If Right(sourcePath, 1) <> "\" Then sourcePath = sourcePath & "\"
+    
+    ' 设置模板路径
+    templatePath = "F:\WinCache\Desktop\202512\"
+    templateFile = templatePath & "表头表尾格式.xlsx"
+    
+    ' 检查模板文件是否存在
+    If Dir(templateFile) = "" Then
+        MsgBox "错误：找不到模板文件！请检查路径：" & vbCrLf & templateFile, vbExclamation
+        Exit Sub
+    End If
+    
+    ' 打开模板文件（只读模式）
+    Set wbTemplate = Workbooks.Open(templateFile, ReadOnly:=True)
+    Set wsTemplate = wbTemplate.Sheets(1)
+    
+    ' 设置源工作表
+    Set wsSource = wbSource.ActiveSheet
+    lastRow = wsSource.Cells(wsSource.Rows.Count, "C").End(xlUp).Row
+    
+    ' 获取C列的唯一值
+    Set uniqueValues = New Collection
+    On Error Resume Next
+    For i = 2 To lastRow
+        currentValue = wsSource.Cells(i, 3).Value
+        If currentValue <> "" Then
+            uniqueValues.Add currentValue, CStr(currentValue)
+        End If
+    Next i
+    On Error GoTo ErrorHandler
+    
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' 遍历每个唯一值
+    For i = 1 To uniqueValues.Count
+        currentValue = uniqueValues(i)
+        
+        ' 创建新工作簿
+        Set wbNew = Workbooks.Add(xlWBATWorksheet)
+        Set wsNew = wbNew.Sheets(1)
+        
+        ' === 插入表头 ===
+        wsTemplate.Rows("1:7").Copy
+        wsNew.Rows(1).Insert Shift:=xlDown
+        Application.CutCopyMode = False
+        
+        ' === 复制数据行 ===
+        j = 8 ' 从第8行开始（表头占1-7行）
+        
+        ' 查找所有匹配的行
+        Set rng = wsSource.Range("C2:C" & lastRow)
+        Set foundCell = rng.Find(currentValue, LookIn:=xlValues)
+        
+        If Not foundCell Is Nothing Then
+            firstAddress = foundCell.Address
+            Do
+                ' 复制整行到新工作表
+                foundCell.EntireRow.Copy wsNew.Cells(j, 1)
+                j = j + 1
+                Set foundCell = rng.FindNext(foundCell)
+            Loop While Not foundCell Is Nothing And foundCell.Address <> firstAddress
+        End If
+        
+        ' === 更新特定单元格数据 ===
+        If j > 8 Then
+            ' 从D列获取数据
+            wsNew.Range("B6").Value = wsNew.Range("D8").Value
+        End If
+        
+        ' === 删除C列和D列 ===
+        wsNew.Columns("C:D").Delete Shift:=xlToLeft
+        
+        ' === 插入表尾 ===
+        lastDataRowBeforeFooter = wsNew.Cells(wsNew.Rows.Count, 1).End(xlUp).Row
+        wsTemplate.Rows("9:15").Copy
+        wsNew.Rows(lastDataRowBeforeFooter + 1).Insert Shift:=xlDown
+        Application.CutCopyMode = False
+        
+        ' === 调整H列和J列的SUM公式 ===
+        Dim sumFormulaRow As Long
+        sumFormulaRow = lastDataRowBeforeFooter + 4
+        
+        ' 添加H列和J列SUM公式
+        wsNew.Cells(sumFormulaRow, "H").Formula = "=SUM(H8:H" & lastDataRowBeforeFooter & ")"
+        wsNew.Cells(sumFormulaRow, "J").Formula = "=SUM(J8:J" & lastDataRowBeforeFooter & ")"
+        
+        ' === 复制模板文件A-L列的列宽 ===
+        For col = 1 To 12
+            wsNew.Columns(col).ColumnWidth = wsTemplate.Columns(col).ColumnWidth
+        Next col
+        
+        ' === 合并单元格 ===
+        Dim k As Integer
+        For k = 1 To 5
+            wsNew.Range("A" & k & ":L" & k).Merge
+        Next k
+        
+        ' === 重命名工作表 ===
+        On Error Resume Next
+        wsNew.Name = "销售出库明细"
+        On Error GoTo 0
+        
+        ' === 保存文件（保存在源文件位置）===
+        saveName = sourcePath & currentValue & ".xls"
+        
+        ' 检查文件是否已存在，如果存在则删除
+        If Dir(saveName) <> "" Then
+            Kill saveName
+        End If
+        
+        wbNew.SaveAs saveName
+        wbNew.Close
+    Next i
+    
+    ' 关闭模板文件
+    wbTemplate.Close SaveChanges:=False
+    
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    
+    MsgBox "操作成功完成！共处理 " & uniqueValues.Count & " 个文件。" & vbCrLf & _
+           "文件保存在: " & sourcePath & vbCrLf & _
+           "处理内容包括：" & vbCrLf & _
+           "√ 按C列值拆分文件" & vbCrLf & _
+           "√ 插入表头（1-7行）" & vbCrLf & _
+           "√ 插入表尾（8-15行）" & vbCrLf & _
+           "√ 更新B6单元格数据（从D8获取）" & vbCrLf & _
+           "√ 删除C列和D列" & vbCrLf & _
+           "√ 添加H列和J列的SUM公式" & vbCrLf & _
+           "√ 调整A-L列宽" & vbCrLf & _
+           "√ 合并A1-L5单元格" & vbCrLf & _
+           "√ 重命名工作表为'销售出库明细'", vbInformation
+    Exit Sub
+    
+ErrorHandler:
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "运行时错误：" & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
