@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *.pyo
+~$*.xlsx
+~$*.xls
 .pytest_cache/
 .mypy_cache/
 
@@ -29,4 +31,4 @@ assets/
 !.env.example
 
 # Private business data (a sanitized replacement is stored in sample_data/)
-/202601销售出库.xlsx
+/*销售出库.xlsx

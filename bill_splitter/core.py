@@ -10,7 +10,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
@@ -32,7 +32,6 @@ except ImportError:  # pragma: no cover - 安装包会包含 xlrd
 
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls"}
-SOURCE_COLUMNS = (4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -83,6 +82,61 @@ class GroupData:
     output_name: str = ""
 
 
+@dataclass(frozen=True)
+class SourceSchema:
+    date_column: int
+    order_column: int
+    split_key_column: int
+    customer_column: int
+    short_name_column: int
+    quantity_column: int
+    amount_column: int
+    output_columns: tuple[int, ...]
+
+
+def _header_text(reader: CellReader, column: int) -> str:
+    return display_text(reader.value(1, column)).replace(" ", "")
+
+
+def detect_source_schema(reader: CellReader) -> SourceSchema:
+    """通过业务表头识别扩展版和紧凑版销售出库结构。"""
+    expected_after_short = (
+        "客户简称", "品号", "品名", "规格", "单位名称",
+        "已出库业务数量", "单价", "未结算原币金额", "备注", "备注",
+    )
+    headers = {column: _header_text(reader, column) for column in range(1, reader.max_column + 1)}
+    for short_column in range(5, reader.max_column - 8):
+        actual = tuple(headers.get(short_column + offset, "") for offset in range(10))
+        unit_matches = actual[4] in {"单位名称", "单位"}
+        amount_matches = actual[7] in {"未结算原币金额", "金额"}
+        if (
+            actual[:4] == expected_after_short[:4]
+            and unit_matches
+            and actual[5:7] == expected_after_short[5:7]
+            and amount_matches
+            and actual[8:] == expected_after_short[8:]
+            and headers.get(short_column - 1) == "客户全称"
+            and headers.get(short_column - 4) in {"日期", "单据日期"}
+            and headers.get(short_column - 3) == "单号"
+        ):
+            return SourceSchema(
+                date_column=short_column - 4,
+                order_column=short_column - 3,
+                split_key_column=short_column - 2,
+                customer_column=short_column - 1,
+                short_name_column=short_column,
+                quantity_column=short_column + 5,
+                amount_column=short_column + 7,
+                output_columns=(short_column - 4, short_column - 3, *range(short_column, short_column + 10)),
+            )
+    readable_headers = "、".join(value for value in headers.values() if value)[:240]
+    raise ValidationError(
+        "无法识别销售出库文件结构。需要包含连续字段：日期、单号、拆分键、客户全称、"
+        "客户简称、品号、品名、规格、单位名称、已出库业务数量、单价、未结算原币金额、备注、备注。"
+        f"\n当前表头：{readable_headers}"
+    )
+
+
 @dataclass
 class SplitResult:
     total: int
@@ -92,6 +146,20 @@ class SplitResult:
     output_dir: Path
     errors: list[str] = field(default_factory=list)
     outputs: list[Path] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class HeaderFooterOverrides:
+    company_title: str
+    bill_year: int
+    bill_month: int
+    statement_date: date
+
+    def __post_init__(self) -> None:
+        if not self.company_title.strip():
+            raise ValidationError("公司抬头不能为空。")
+        if not 1 <= self.bill_month <= 12:
+            raise ValidationError("账单月份必须在 1–12 之间。")
 
 
 class CellReader(Protocol):
@@ -632,6 +700,7 @@ class BillSplitter:
         pause: PauseController | None = None,
         progress: Callable[[ProgressUpdate], None] | None = None,
         confirm_overwrite: Callable[[list[Path]], bool] | None = None,
+        header_footer: HeaderFooterOverrides | None = None,
     ) -> None:
         self.source_path = Path(source_path).expanduser().resolve()
         self.template_path = Path(template_path).expanduser().resolve()
@@ -639,6 +708,7 @@ class BillSplitter:
         self.pause = pause or PauseController()
         self.progress = progress or (lambda _: None)
         self.confirm_overwrite = confirm_overwrite or (lambda _: False)
+        self.header_footer = header_footer
 
     def validate_paths(self) -> None:
         for label, path in (("待拆分文件", self.source_path), ("表头表尾模板", self.template_path)):
@@ -659,20 +729,19 @@ class BillSplitter:
     def _emit(self, phase: str, message: str, completed: int = 0, total: int = 0, current: str = "") -> None:
         self.progress(ProgressUpdate(phase, message, completed, total, current))
 
-    def _group_rows(self, source: CellReader) -> tuple[list[GroupData], int]:
-        if source.max_column < 17:
-            raise ValidationError(f"源工作表至少需要 A–Q 共 17 列，当前只有 {source.max_column} 列。")
+    def _group_rows(self, source: CellReader, schema: SourceSchema | None = None) -> tuple[list[GroupData], int]:
+        schema = schema or detect_source_schema(source)
         if source.max_row < 2:
             raise ValidationError("源工作表没有可拆分的数据行。")
-        month_label = display_text(source.value(1, 6))
+        month_label = display_text(source.value(1, schema.split_key_column))
         groups: OrderedDict[str, GroupData] = OrderedDict()
         skipped = 0
         for row in range(2, source.max_row + 1):
             if row % 50 == 0:
                 self.pause.checkpoint()
                 self._emit("读取", f"正在读取并分组：第 {row}/{source.max_row} 行")
-            key = display_text(source.value(row, 6))
-            customer = display_text(source.value(row, 7))
+            key = display_text(source.value(row, schema.split_key_column))
+            customer = display_text(source.value(row, schema.customer_column))
             if not key and customer and month_label:
                 key = f"{customer}{month_label}"
             if not key:
@@ -701,11 +770,37 @@ class BillSplitter:
         group: GroupData,
         destination: Path,
         formula_source: CellReader | None = None,
+        schema: SourceSchema | None = None,
     ) -> None:
+        schema = schema or detect_source_schema(source)
         wb, ws, last_data_row, footer_start = template.create_sheet(len(group.rows))
         temp_path: Path | None = None
         try:
             ws["B6"] = group.customer_name
+            if self.header_footer is not None:
+                settings = self.header_footer
+                ws["A1"] = settings.company_title.strip()
+                ws["A5"] = f"{settings.bill_year}年{settings.bill_month:02d}月对账单"
+                date_row = footer_start + 5
+                date_cell = ws.cell(date_row, 12)
+                # 直接写文本，避免部分 WPS/预览器把 Excel 日期序列显示成 46203。
+                date_cell.value = (
+                    f"{settings.statement_date.year}年"
+                    f"{settings.statement_date.month}月{settings.statement_date.day}日"
+                )
+                date_cell.number_format = "@"
+                note_cell = ws.cell(footer_start + 6, 1)
+                if isinstance(note_cell.value, str):
+                    deadline = (
+                        f"截止于 {settings.statement_date.year} 年 "
+                        f"{settings.statement_date.month:02d}月 {settings.statement_date.day:02d}日"
+                    )
+                    note_cell.value = re.sub(
+                        r"截止于\s*\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日",
+                        deadline,
+                        note_cell.value,
+                        count=1,
+                    )
             formula_reader = formula_source or source
             formula_caches: dict[str, Any] = {}
             quantity_total = Decimal("0")
@@ -713,15 +808,15 @@ class BillSplitter:
             for output_offset, source_row in enumerate(group.rows):
                 self.pause.checkpoint()
                 output_row = 8 + output_offset
-                for output_col, source_col in enumerate(SOURCE_COLUMNS, start=1):
+                for output_col, source_col in enumerate(schema.output_columns, start=1):
                     target_cell = ws.cell(output_row, output_col)
                     formula_reader.copy_cell_to(source_row, source_col, target_cell)
                     if isinstance(target_cell.value, str) and target_cell.value.startswith("="):
                         cached_value = source.value(source_row, source_col)
                         if cached_value is not None:
                             formula_caches[target_cell.coordinate] = cached_value
-                quantity = _decimal_number(source.value(source_row, 13))
-                amount = _decimal_number(source.value(source_row, 15))
+                quantity = _decimal_number(source.value(source_row, schema.quantity_column))
+                amount = _decimal_number(source.value(source_row, schema.amount_column))
                 if quantity is not None:
                     quantity_total += quantity
                 if amount is not None:
@@ -769,7 +864,8 @@ class BillSplitter:
                 formula_source = open_reader(self.source_path, data_only=False)
             else:
                 formula_source = source
-            groups, skipped = self._group_rows(source)
+            schema = detect_source_schema(source)
+            groups, skipped = self._group_rows(source, schema)
             self._emit("模板", "正在读取表头表尾模板……", 0, len(groups))
             template = TemplateSnapshot(self.template_path)
             conflicts = [self.output_dir / group.output_name for group in groups if (self.output_dir / group.output_name).exists()]
@@ -781,7 +877,14 @@ class BillSplitter:
                 self._emit("写入", f"正在生成：{group.key}", index - 1, len(groups), group.key)
                 destination = self.output_dir / group.output_name
                 try:
-                    self._write_group(source, template, group, destination, formula_source=formula_source)
+                    self._write_group(
+                        source,
+                        template,
+                        group,
+                        destination,
+                        formula_source=formula_source,
+                        schema=schema,
+                    )
                     result.succeeded += 1
                     result.outputs.append(destination)
                 except Exception as exc:

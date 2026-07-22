@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
@@ -11,12 +12,16 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, PatternFill
 from PIL import Image as PILImage
+from app import BillSplitterApp
 
 from bill_splitter.core import (
     BillSplitter,
+    HeaderFooterOverrides,
     PauseController,
     ValidationError,
     chinese_upper_rmb,
+    detect_source_schema,
+    open_reader,
     patch_formula_caches,
     sanitize_filename,
 )
@@ -27,10 +32,12 @@ class CoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.source = self.root / "source.xlsx"
+        self.compact_source = self.root / "compact-source.xlsx"
         self.template = self.root / "template.xlsx"
         self.output = self.root / "out"
         self.output.mkdir()
         self._make_source()
+        self._make_compact_source()
         self._make_template()
         self.source_xls = self.root / "source.xls"
         self.template_xls = self.root / "template.xls"
@@ -42,8 +49,11 @@ class CoreTests(unittest.TestCase):
     def _make_source(self) -> None:
         wb = Workbook()
         ws = wb.active
-        headers = [f"列{i}" for i in range(1, 18)]
-        headers[5] = " 2026-01月"
+        headers = [
+            "销售域名称", "异动别", "单据日期", "日期", "单号", " 2026-01月",
+            "客户全称", "客户简称", "品号", "品名", "规格", "单位名称",
+            "已出库业务数量", "单价", "未结算原币金额", "备注", "备注",
+        ]
         ws.append(headers)
         rows = [
             ("客户甲 2026-01月", "客户甲", "甲简称", 2, 12.5, 25),
@@ -87,6 +97,8 @@ class CoreTests(unittest.TestCase):
         ws["B12"] = "=J12"
         ws["H12"] = "=SUM(H8:H11)"
         ws["J12"] = "=SUM(J8:J11)"
+        ws["L14"] = datetime(2026, 1, 31)
+        ws["A15"] = "附注：截止于 2026 年 01月 31日贵公司欠我司款项。"
         ws.merge_cells("A15:L15")
         ws.column_dimensions["A"].width = 18
         ws.row_dimensions[15].height = 30
@@ -96,11 +108,40 @@ class CoreTests(unittest.TestCase):
         ws.add_image(XLImage(io.BytesIO(logo_path.read_bytes())), "E1")
         wb.save(self.template)
 
+    def _make_compact_source(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append([
+            "日期", "单号", " 2026-06月", "客户全称", "客户简称", "品号", "品名",
+            "规格", "单位名称", "已出库业务数量", "单价", "未结算原币金额", "备注", "备注",
+        ])
+        rows = [
+            ("紧凑客户甲有限公司", "紧凑甲", 10, 2.5, 25),
+            ("紧凑客户甲有限公司", "紧凑甲", 5, 4, 20),
+            ("紧凑客户乙有限公司", "紧凑乙", 3, 10, 30),
+        ]
+        caches = {}
+        for row_index, (customer, short_name, quantity, price, amount) in enumerate(rows, start=2):
+            sheet.append([
+                datetime(2026, 6, row_index), f"COMPACT-{row_index}", f"{customer} 2026-06月",
+                customer, short_name, f"ITEM-{row_index}", f"品名-{row_index}", "规格",
+                "PCS", quantity, price, f"=J{row_index}*K{row_index}", "摘要", "备注",
+            ])
+            caches[f"L{row_index}"] = amount
+        workbook.save(self.compact_source)
+        workbook.close()
+        patch_formula_caches(self.compact_source, caches)
+
     def _make_xls_files(self) -> None:
         source_book = xlwt.Workbook()
         source_sheet = source_book.add_sheet("数据")
-        for col in range(17):
-            source_sheet.write(0, col, " 2026-01月" if col == 5 else f"列{col + 1}")
+        headers = [
+            "销售域名称", "异动别", "单据日期", "日期", "单号", " 2026-01月",
+            "客户全称", "客户简称", "品号", "品名", "规格", "单位名称",
+            "已出库业务数量", "单价", "未结算原币金额", "备注", "备注",
+        ]
+        for col, header in enumerate(headers):
+            source_sheet.write(0, col, header)
         values = [
             ("客户甲 2026-01月", "客户甲", "甲简称"),
             ("客户/乙 2026-01月", "客户/乙", "乙简称"),
@@ -131,6 +172,12 @@ class CoreTests(unittest.TestCase):
             self.source, self.template, self.output,
             pause=PauseController(), progress=progress.append,
             confirm_overwrite=lambda _: True,
+            header_footer=HeaderFooterOverrides(
+                company_title="测试科技有限公司",
+                bill_year=2027,
+                bill_month=3,
+                statement_date=date(2027, 3, 31),
+            ),
         ).run()
         self.assertEqual((result.total, result.succeeded, result.failed, result.skipped_rows), (2, 2, 0, 1))
         first = self.output / "客户甲 2026-01月.xlsx"
@@ -140,6 +187,11 @@ class CoreTests(unittest.TestCase):
         wb = openpyxl.load_workbook(first, data_only=False)
         ws = wb["销售出库明细"]
         self.assertEqual(ws["B6"].value, "客户甲")
+        self.assertEqual(ws["A1"].value, "测试科技有限公司")
+        self.assertEqual(ws["A5"].value, "2027年03月对账单")
+        self.assertEqual(ws["L15"].value, "2027年3月31日")
+        self.assertEqual(ws["L15"].number_format, "@")
+        self.assertIn("截止于 2027 年 03月 31日", ws["A16"].value)
         self.assertEqual(ws["C7"].value, "T7-5")
         self.assertEqual(ws["D7"].value, "T7-6")
         self.assertEqual(ws["K7"].value, "T7-13")
@@ -197,6 +249,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(chinese_upper_rmb(1350), "壹仟叁佰伍拾元整")
         self.assertEqual(chinese_upper_rmb("10001.05"), "壹万零壹元零伍分")
 
+    def test_manual_header_input_parsing(self) -> None:
+        self.assertEqual(BillSplitterApp._parse_bill_month("2026-01"), (2026, 1))
+        self.assertEqual(BillSplitterApp._parse_bill_month("2026年1月"), (2026, 1))
+        self.assertEqual(BillSplitterApp._parse_statement_date("2026-01-31"), date(2026, 1, 31))
+        self.assertEqual(BillSplitterApp._parse_statement_date("2026年1月31日"), date(2026, 1, 31))
+        self.assertEqual(BillSplitterApp._parse_statement_date("2026-06-31"), date(2026, 6, 30))
+        self.assertEqual(BillSplitterApp._parse_statement_date("2026-02-30"), date(2026, 2, 28))
+        self.assertEqual(BillSplitterApp._parse_statement_date("2028-02-30"), date(2028, 2, 29))
+        with self.assertRaises(ValidationError):
+            BillSplitterApp._parse_bill_month("2026-13")
+        with self.assertRaises(ValidationError):
+            BillSplitterApp._parse_statement_date("2026-00-10")
+
     def test_xls_xlsx_input_combinations(self) -> None:
         combinations = [
             (self.source, self.template_xls),
@@ -214,6 +279,36 @@ class CoreTests(unittest.TestCase):
                     wb = openpyxl.load_workbook(generated)
                     self.assertIn("销售出库明细", wb.sheetnames)
                     wb.close()
+
+    def test_compact_202606_layout(self) -> None:
+        reader = open_reader(self.compact_source, data_only=True)
+        try:
+            schema = detect_source_schema(reader)
+            self.assertEqual(schema.split_key_column, 3)
+            self.assertEqual(schema.customer_column, 4)
+            self.assertEqual(schema.output_columns, (1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))
+        finally:
+            reader.close()
+        output = self.root / "compact-out"
+        output.mkdir()
+        result = BillSplitter(self.compact_source, self.template, output, confirm_overwrite=lambda _: True).run()
+        self.assertEqual((result.total, result.succeeded, result.failed), (2, 2, 0))
+        generated = output / "紧凑客户甲有限公司 2026-06月.xlsx"
+        workbook = openpyxl.load_workbook(generated, data_only=False)
+        sheet = workbook["销售出库明细"]
+        self.assertEqual(sheet["A8"].value, datetime(2026, 6, 2))
+        self.assertEqual(sheet["B8"].value, "COMPACT-2")
+        self.assertEqual(sheet["C8"].value, "紧凑甲")
+        self.assertEqual(sheet["J8"].value, "=H8*I8")
+        self.assertEqual(sheet["H13"].value, "=SUM(H8:H9)")
+        self.assertEqual(sheet["J13"].value, "=SUM(J8:J9)")
+        workbook.close()
+        cached = openpyxl.load_workbook(generated, data_only=True)
+        cached_sheet = cached["销售出库明细"]
+        self.assertEqual(cached_sheet["J8"].value, 25)
+        self.assertEqual(cached_sheet["H13"].value, 15)
+        self.assertEqual(cached_sheet["J13"].value, 45)
+        cached.close()
 
 
 if __name__ == "__main__":
